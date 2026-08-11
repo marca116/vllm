@@ -10,6 +10,7 @@ requires = [
     "torch == 2.11.0",
     "wheel",
     "jinja2",
+    "transformers==5.14.1" # Avoids transformer >=5.15 issue with gemma models
 ]
 build-backend = "setuptools.build_meta"
 

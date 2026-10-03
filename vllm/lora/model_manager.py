@@ -322,8 +322,26 @@ class LoRAModelManager:
             "Activating LoRA. int id: %d, slot index: %d", lora_model.id, index
         )
         self.lora_index_to_id[index] = lora_model.id
+        # Deduplicate by physical module identity. Gemma 4 (and similar
+        # YOCO / fast-prefill splits) can expose the same LoRA wrapper under
+        # multiple names, e.g. `layers.0...` and
+        # `self_decoder.decoder_layers.0...`. A naive loop would call
+        # set_lora() for the canonical path and then reset_lora() for the
+        # alias, wiping the adapter so serving matches the base model.
+        # Prefer the name that actually has weights so iteration order
+        # cannot skip set_lora(). See vllm-project/vllm#39816.
+        chosen_modules: dict[
+            int, tuple[str, BaseLayerWithLoRA, LoRALayerWeights | None]
+        ] = {}
         for module_name, module in self.modules.items():
             module_lora = self._get_lora_layer_weights(lora_model, module_name)
+            module_key = id(module)
+            if module_key not in chosen_modules or (
+                module_lora is not None and chosen_modules[module_key][2] is None
+            ):
+                chosen_modules[module_key] = (module_name, module, module_lora)
+
+        for module_name, module, module_lora in chosen_modules.values():
             if not module_lora:
                 module.reset_lora(index)
                 logger.debug(

@@ -240,6 +240,55 @@ def test_dedup_shared_module_across_paths(default_vllm_config, dist_init, dummy_
     assert "moe.runner.gate" not in manager.modules
 
 
+def test_activate_adapter_keeps_weights_on_aliased_wrapper(
+    default_vllm_config, dist_init, dummy_model
+):
+    """Gemma 4 YOCO aliases the same wrapper under two names.
+
+    If the alias is visited first and has no matching adapter keys,
+    activation must still apply the canonical weights instead of
+    reset_lora() wiping them (vllm-project/vllm#39816).
+    """
+    model = dummy_model
+
+    class AliasBox(nn.Module):
+        def __init__(self, dense: nn.Module):
+            super().__init__()
+            self.dense1 = dense
+
+    model.add_module("self_decoder", AliasBox(model.dense1))
+    assert model.dense1 is model.self_decoder.dense1
+
+    manager = LoRAModelManager(
+        model,
+        1,
+        1,
+        1,
+        LoRAConfig(
+            max_lora_rank=8, max_cpu_loras=8, max_loras=8, lora_dtype=DEFAULT_DTYPE
+        ),
+        torch.device(DEVICES[0]),
+        default_vllm_config,
+    )
+
+    canonical = "dense1"
+    aliased = "self_decoder.dense1"
+    wrapper = manager.modules[canonical]
+    assert manager.model.get_submodule(aliased) is wrapper
+
+    # Registration-time dedup (#42757) drops the alias from `modules`.
+    # Re-insert it first so activation still has to survive the Gemma 4
+    # serving order: alias (no weights) then canonical (has weights).
+    manager.modules = {aliased: wrapper, canonical: wrapper}
+
+    lora = create_lora(1, manager.model, [canonical], torch.device(DEVICES[0]))
+    assert manager.add_adapter(lora)
+    assert manager.activate_adapter(1)
+
+    assert wrapper.lora_a_stacked[0].abs().sum().item() > 0
+    assert wrapper.lora_b_stacked[0].abs().sum().item() > 0
+
+
 def test_lm_head_exempt_from_dedup(default_vllm_config, dist_init, dummy_model):
     """The dedup logic must NOT collapse `lm_head` even when it is reachable
     from another attribute path (tied-embedding models do
